@@ -1,0 +1,86 @@
+# -*- coding: utf-8 -*-
+"""类型化异常体系（见 docs/architecture.md「错误模型」）。
+
+每个异常带 retryable 标志，未来任务引擎据此决定重试策略。
+当前 MVP 只用到其中一部分，但先把体系立起来，方便后续接入引擎。
+"""
+
+
+class XdlError(Exception):
+    """所有业务异常的基类。"""
+    retryable = False
+    category = "generic"
+
+
+class ConfigError(XdlError):
+    category = "config"
+
+
+class AuthError(XdlError):
+    """未登录 / 会话过期 / 未授权。"""
+    category = "auth"
+
+
+class LoginRequiredError(AuthError):
+    """会话缺失或已失效；继续请求同一批次没有意义。"""
+
+
+class DownloadLimitError(AuthError):
+    """账号级下载额度已耗尽。"""
+    category = "download_limit"
+
+
+class ConsecutiveFailureError(XdlError):
+    """APK 批次连续失败达到阈值；停止继续请求后续曲目。"""
+    category = "consecutive_failures"
+
+
+class SignError(XdlError):
+    """签名生成失败，通常可重试。"""
+    retryable = True
+    category = "sign"
+
+
+class NetworkError(XdlError):
+    """超时 / 连接重置等，可重试。"""
+    retryable = True
+    category = "network"
+
+
+class CancelledByUser(XdlError):
+    """用户请求优雅停止；任务应保留为可恢复状态。"""
+    retryable = True
+    category = "cancelled"
+
+
+class ApiError(XdlError):
+    """接口层错误（限流 / 被拒 / 不存在 / 响应异常）。
+
+    携带平台返回的 ret 码，便于上层精细处理（如 1001 限流可重试）。
+    """
+    category = "api"
+
+    def __init__(self, message: str, ret: int | None = None, retryable: bool = False):
+        super().__init__(message)
+        self.ret = ret
+        self.retryable = retryable
+
+
+class RiskControlError(ApiError):
+    """平台反滥用/限流响应。
+
+    与登录失效、内容未授权分开建模，调用方收到后应暂停整批请求，而不是
+    继续逐项重试。是否以及何时恢复由显式冷却/人工确认决定。
+    """
+    category = "risk_control"
+
+    def __init__(self, message: str, ret: int | None = None):
+        super().__init__(message, ret=ret, retryable=True)
+
+
+class DecodeError(XdlError):
+    category = "decode"
+
+
+class StorageError(XdlError):
+    category = "storage"

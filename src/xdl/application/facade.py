@@ -1,0 +1,397 @@
+# -*- coding: utf-8 -*-
+"""门面（库的公开 API，见 docs/architecture.md「模块边界」）。
+
+各前端（CLI / 未来 WebUI）只依赖这一层。公开方法保持**同步**签名，内部用
+asyncio 驱动异步解析/并发（`asyncio.run` 收口），前端零改动。
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import threading
+from collections.abc import Callable
+
+from ..domain import Quality, TaskState, parse_range, parse_track_id
+from ..errors import XdlError
+from ..ports import (SynchronouslyClosableSource, TaskDeleteResult,
+                     TaskQueryResult, TaskSelectionSummary)
+from ..settings import Settings
+from .usecases import (DownloadTrackUseCase, DownloadAlbumUseCase, AlbumResult,
+                       ResumeUseCase, RetryPolicy, RiskRecoveryPolicy)
+
+
+class Facade:
+    def __init__(self, source, sink, settings: Settings, store=None,
+                 store_factory: Callable[[], object] | None = None):
+        self._source = source
+        self._sink = sink
+        self._settings = settings
+        self._store = store
+        self._store_factory = store_factory
+
+    @classmethod
+    def from_config(cls, settings: Settings | None = None) -> "Facade":
+        from ..composition import build_facade
+        return build_facade(settings)
+
+    def _retry_policy(self) -> RetryPolicy:
+        s = self._settings
+        return RetryPolicy(max_attempts=s.max_attempts,
+                           backoff_base=s.retry_backoff_base,
+                           cooldown=s.cooldown,
+                           global_rounds=s.global_retry_rounds)
+
+    def _risk_recovery_policy(self) -> RiskRecoveryPolicy:
+        s = self._settings
+        return RiskRecoveryPolicy(
+            enabled=s.risk_poll_enabled,
+            initial_wait=s.risk_poll_initial_wait,
+            backoff_factor=s.risk_poll_backoff_factor,
+            max_wait=s.risk_poll_max_wait,
+            max_duration=s.risk_poll_max_duration,
+        )
+
+    def login(self, *, reset: bool = False, cancel=None, notify=None) -> str:
+        """打开浏览器登录并保存会话，返回保存路径。
+
+        `cancel`/`notify` 让无终端的前端（WebUI）也能等待并中断这段交互；
+        不传就是 CLI 的老行为（打印到 stdout、不可中断）。
+        `reset=True` 表示换账号：先清掉现有登录凭据再登录。
+        """
+        return self._source.interactive_login(
+            reset=reset, cancel=cancel, notify=notify)
+
+    def auth_status(self) -> dict:
+        method = getattr(self._source, "auth_status", None)
+        if method is None:
+            return {"backend": self._settings.source_backend,
+                    "authenticated": False, "multi_step": False}
+        return method()
+
+    def login_config(self) -> dict:
+        method = getattr(self._source, "login_config", None)
+        if method is None:
+            raise XdlError("当前音源不支持 APK 协议登录。")
+        return method()
+
+    def send_login_sms(self, mobile: str, fds_otp: dict) -> dict:
+        method = getattr(self._source, "send_sms", None)
+        if method is None:
+            raise XdlError("当前音源不支持 APK 短信登录。")
+        return method(mobile, fds_otp)
+
+    def verify_login_sms(self, code: str) -> dict:
+        method = getattr(self._source, "verify_sms", None)
+        if method is None:
+            raise XdlError("当前音源不支持 APK 短信登录。")
+        return self._finish_login(method(code))
+
+    def login_password(self, account: str, password: str, mode: str,
+                       fds_otp: dict) -> dict:
+        method = getattr(self._source, "login_password", None)
+        if method is None:
+            raise XdlError("当前音源不支持 APK 账号密码登录。")
+        return self._finish_login(method(account, password, mode, fds_otp))
+
+    def _finish_login(self, result: dict) -> dict:
+        """统一持久登录结果后的鉴权失败任务恢复。"""
+        requeued = 0
+        if result.get("authenticated"):
+            store = self._task_store()
+            if store is not None:
+                try:
+                    requeue = getattr(store, "requeue_failed_category", None)
+                    if requeue is not None:
+                        requeued = requeue("auth")
+                finally:
+                    store.close()
+                    if self._store is store:
+                        self._store = None
+        return {**result, "requeued_auth_tasks": requeued}
+
+    def logout(self) -> dict:
+        method = getattr(self._source, "logout", None)
+        if method is None:
+            raise XdlError("当前音源不支持独立登出。")
+        # 浏览器后端的 logout 会回报清掉了哪些凭据（Cookie 缓存 / Profile），
+        # 一并带出去，前端才能说清"到底删了什么"。APK 侧返回 None。
+        detail = method() or {}
+        return {**self.auth_status(), **detail}
+
+    def switch_account(self, uid: str) -> dict:
+        method = getattr(self._source, "switch_account", None)
+        if method is None:
+            raise XdlError("当前音源不支持 APK 多账号切换。")
+        return method(uid)
+
+    def delete_account(self, uid: str) -> dict:
+        method = getattr(self._source, "delete_account", None)
+        if method is None:
+            raise XdlError("当前音源不支持删除 APK 账号。")
+        return method(uid)
+
+    def download_track(self, target: str, quality: str | None = None,
+                       reporter=None, cancel: threading.Event | None = None) -> str:
+        """下载单个音频，返回落盘路径。`cancel` 供外部触发停止。"""
+        return asyncio.run(self._download_track(target, quality, reporter, cancel))
+
+    def download_album(self, target: str, quality: str | None = None,
+                       range_: str | None = None, reporter=None,
+                       cancel: threading.Event | None = None) -> AlbumResult:
+        """并发批量下载专辑，返回下载汇总。range_ 形如 '1-20' / '5-' / '-10' / '7'。
+
+        `cancel` 供外部调用方触发优雅停止（等价于 Ctrl-C）。
+        """
+        return asyncio.run(self._download_album(target, quality, range_, reporter,
+                                                cancel))
+
+    def resume(self, reporter=None,
+               cancel: threading.Event | None = None) -> list[AlbumResult]:
+        """继续任务库中未完成的专辑下载。`cancel` 供外部触发优雅停止。"""
+        return asyncio.run(self._resume(reporter, cancel))
+
+    def all_tasks(self):
+        """只读：返回任务库中的全部任务（供外部界面渲染）。无任务库时返回 []。"""
+        store = self._task_store()
+        return store.all_tasks() if store is not None else []
+
+    def query_tasks(self, *, state: TaskState | None = None,
+                    search: str = "", album_id: str = "",
+                    limit: int = 100, offset: int = 0) -> TaskQueryResult:
+        """只读：查询有界任务页；无任务库时返回稳定的空页。"""
+        store = self._task_store()
+        if store is None:
+            return TaskQueryResult(
+                tasks=[], total=0,
+                counts={task_state: 0 for task_state in TaskState},
+                offset=0, limit=limit,
+            )
+        return store.query_tasks(
+            state=state, search=search, album_id=album_id,
+            limit=limit, offset=offset,
+        )
+
+    def query_task_ids(self, *, state: TaskState | None = None,
+                       search: str = "", album_id: str = "",
+                       cap: int = 5000) -> list[int]:
+        """只读：当前筛选命中的全部任务 id，供前端「选中全部」取快照。"""
+        store = self._task_store()
+        if store is None:
+            return []
+        return store.query_task_ids(
+            state=state, search=search, album_id=album_id, cap=cap,
+        )
+
+    def summarize_tasks(self, ids: list[int]) -> TaskSelectionSummary:
+        """只读：一批任务 id 的删除后果预览。"""
+        store = self._task_store()
+        if store is None:
+            return TaskSelectionSummary()
+        return store.summarize_tasks(ids)
+
+    def delete_tasks(self, ids: list[int]) -> TaskDeleteResult:
+        """删除任务记录并清理其 .part 半成品；成品音频不受影响。"""
+        store = self._task_store()
+        if store is None:
+            return TaskDeleteResult()
+        return store.delete_tasks(ids)
+
+    def requeue_tasks(self, ids: list[int]) -> int:
+        """把选中的失败任务放回待恢复队列，返回实际改动条数。"""
+        store = self._task_store()
+        if store is None:
+            return 0
+        return store.requeue_tasks(ids)
+
+    def close(self) -> None:
+        """释放惰性创建的任务库，供常驻前端重载配置或关闭进程。"""
+        store, self._store = self._store, None
+        if store is not None:
+            close = getattr(store, "close", None)
+            if close is not None:
+                close()
+        # 持有长驻连接的音源（如 APK 的 HTTP 会话）经可选端口同步释放，
+        # 而不是伸手进适配器内部结构（.client.close()）——后者是 Message
+        # Chain，破坏了"应用层只依赖端口"的约束。
+        if isinstance(self._source, SynchronouslyClosableSource):
+            self._source.close_sync()
+
+    def list_formats(self, target: str) -> dict:
+        """列出某个曲目所有可用音质格式（类似 yt-dlp -F）。
+
+        返回曲目信息及已排序的格式元数据。本方法不发起音频下载请求，
+        也不向调用方返回播放 URL。
+        """
+        return asyncio.run(self._list_formats(target))
+
+    def inspect_storage(self) -> dict:
+        """诊断：列出当前 Profile 的设备标识存储 key 名（不读 value），
+        验证"清 Cookie"覆盖面是否完整。只读、不下载、不重置设备指纹。"""
+        return asyncio.run(self._source.inspect_storage())
+
+    # ---- 内部异步实现 ----
+    async def _download_track(self, target, quality, reporter, cancel=None) -> str:
+        q = Quality(quality or self._settings.default_quality)
+        usecase = DownloadTrackUseCase(self._source, self._sink,
+                                       self._settings.download_dir,
+                                       retry=self._retry_policy(),
+                                       store=self._optional_store(),
+                                       cancel_event=cancel,
+                                       risk_recovery=self._risk_recovery_policy())
+        await self._source.open()
+        try:
+            return await usecase.execute(target, q, reporter)
+        finally:
+            await self._source.close()
+
+    async def _download_album(self, target, quality, range_, reporter,
+                              cancel=None) -> AlbumResult:
+        q = Quality(quality or self._settings.default_quality)
+        start, end = parse_range(range_)
+        stop_event = asyncio.Event()
+        cancel_event = threading.Event()
+        store = self._task_store()
+        cleanup_signal = self._install_sigint_handler(stop_event, cancel_event)
+        watcher = self._watch_external_cancel(cancel, stop_event, cancel_event)
+        usecase = DownloadAlbumUseCase(self._source, self._sink,
+                                       self._settings.download_dir,
+                                       concurrency=self._settings.max_concurrency,
+                                       retry=self._retry_policy(),
+                                       store=store,
+                                       stop_event=stop_event,
+                                       cancel_event=cancel_event,
+                                       risk_recovery=self._risk_recovery_policy())
+        # 全程复用一个 Chrome 会话（共享上下文里按需开 page 并发解析）
+        try:
+            await self._source.open()
+            try:
+                result = await usecase.execute(target, q, start, end, reporter)
+            finally:
+                await self._source.close()
+            if stop_event.is_set():
+                result.stopped = True
+            return result
+        finally:
+            self._cancel_task(watcher)
+            cleanup_signal()
+
+    async def _resume(self, reporter, cancel=None) -> list[AlbumResult]:
+        store = self._task_store()
+        if store is None:
+            return []
+        # 已登录时恢复此前因鉴权失败的任务：登录后第一次 resume 不该让用户
+        # 手动挑出那些"当时没登录所以失败"的条目。与具体后端无关——任何能在
+        # auth_status 里报告登录态的音源都走这段通用恢复。
+        if self.auth_status().get("authenticated"):
+            requeue = getattr(store, "requeue_failed_category", None)
+            if requeue is not None:
+                restored = await asyncio.to_thread(requeue, "auth")
+                if restored and reporter is not None:
+                    reporter.note(f"已登录，已恢复 {restored} 个鉴权失败任务。")
+        stop_event = asyncio.Event()
+        cancel_event = threading.Event()
+        cleanup_signal = self._install_sigint_handler(stop_event, cancel_event)
+        watcher = self._watch_external_cancel(cancel, stop_event, cancel_event)
+        usecase = ResumeUseCase(self._source, self._sink,
+                                self._settings.download_dir, store,
+                                concurrency=self._settings.max_concurrency,
+                                retry=self._retry_policy(),
+                                stop_event=stop_event,
+                                cancel_event=cancel_event,
+                                risk_recovery=self._risk_recovery_policy())
+        try:
+            result = await usecase.execute(reporter)
+            if stop_event.is_set():
+                for album_result in result:
+                    album_result.stopped = True
+            return result
+        finally:
+            self._cancel_task(watcher)
+            cleanup_signal()
+
+    async def _list_formats(self, target: str) -> dict:
+        track_id = parse_track_id(target)
+        await self._source.open()
+        try:
+            track = await self._source.get_track(track_id)
+        finally:
+            await self._source.close()
+        formats = [
+            {
+                "type": p.type,
+                "codec": p.codec,
+                "bitrate": p.bitrate,
+                "file_size": p.file_size,
+            }
+            for p in track.available_play_urls()
+        ]
+        return {
+            "title": track.title,
+            "track_id": track.track_id,
+            "formats": formats,
+            "default_quality": self._settings.default_quality,
+        }
+
+    def _watch_external_cancel(self, cancel: threading.Event | None,
+                               stop_event: asyncio.Event,
+                               cancel_event: threading.Event):
+        """把外部 threading.Event 桥接到内部的优雅停止机制。"""
+        if cancel is None:
+            return None
+
+        async def _watch() -> None:
+            try:
+                while not cancel.is_set():
+                    if stop_event.is_set():
+                        return
+                    await asyncio.sleep(0.1)
+                stop_event.set()
+                cancel_event.set()
+            except asyncio.CancelledError:
+                pass
+
+        return asyncio.ensure_future(_watch())
+
+    @staticmethod
+    def _cancel_task(task) -> None:
+        if task is not None:
+            task.cancel()
+
+    def _task_store(self):
+        if self._store is None and self._store_factory is not None:
+            self._store = self._store_factory()
+        return self._store
+
+    def _optional_store(self):
+        """尽力拿任务库；坏了就返回 None，让单曲下载照常进行（记不进面板而已）。"""
+        try:
+            return self._task_store()
+        except XdlError:
+            return None
+
+    def _install_sigint_handler(self, stop_event: asyncio.Event,
+                                cancel_event: threading.Event):
+        loop = asyncio.get_running_loop()
+
+        def request_stop() -> None:
+            if stop_event.is_set():
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+                os.kill(os.getpid(), signal.SIGINT)
+                return
+            stop_event.set()
+            cancel_event.set()
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, request_stop)
+            return lambda: loop.remove_signal_handler(signal.SIGINT)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                previous = signal.getsignal(signal.SIGINT)
+                signal.signal(
+                    signal.SIGINT,
+                    lambda _sig, _frame: loop.call_soon_threadsafe(request_stop),
+                )
+            except (RuntimeError, ValueError):
+                return lambda: None
+            return lambda: signal.signal(signal.SIGINT, previous)

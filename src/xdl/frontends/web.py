@@ -1,0 +1,362 @@
+# -*- coding: utf-8 -*-
+"""FastAPI WebUI 入口与 JSON API。"""
+from __future__ import annotations
+
+import argparse
+import threading
+import webbrowser
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
+
+from ..errors import XdlError
+from .web_runtime import (OperationBusyError, OperationNotCancellableError,
+                          WebRuntime)
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DownloadRequest(StrictModel):
+    mode: Literal["track", "album"]
+    target: str = Field(min_length=1)
+    quality: Literal["high", "standard", "low"] | None = None
+    range: str | None = None
+
+
+class TargetRequest(StrictModel):
+    target: str = Field(min_length=1)
+
+
+class GenSignRequest(StrictModel):
+    device_info_path: str | None = None
+    repeat: int = Field(default=1, ge=1, le=20)
+
+
+class ExtractDeviceRequest(StrictModel):
+    output: str | None = None
+    profile: str | None = None
+    headless: bool = True
+    refresh: bool = False
+    fresh_profile: bool = False
+
+
+class RefreshCookiesRequest(StrictModel):
+    headless: bool = True
+
+
+class LoginRequest(StrictModel):
+    # 换账号：先清掉现有凭据再开浏览器。不清的话 Profile 里的旧 token 会让
+    # 登录轮询秒命中，浏览器一闪即关，存下来的还是同一个账号。
+    switch_account: bool = False
+
+
+class OpenDownloadsRequest(StrictModel):
+    task_id: int | None = None
+
+
+class TaskSelectionRequest(StrictModel):
+    """一批任务 id。用 POST 而不是带 body 的 DELETE：后者在部分中间件上行为不可靠。"""
+
+    ids: list[int] = Field(min_length=1, max_length=5000)
+
+
+class ApkSmsRequest(StrictModel):
+    mobile: str = Field(min_length=6, max_length=18)
+    fds_otp: dict
+
+
+class ApkVerifyRequest(StrictModel):
+    code: str = Field(min_length=4, max_length=8)
+
+
+class ApkPasswordRequest(StrictModel):
+    account: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+    mode: Literal["mobile", "email"]
+    fds_otp: dict
+
+
+class ApkAccountRequest(StrictModel):
+    uid: str = Field(pattern=r"^\d+$", min_length=1, max_length=32)
+
+
+class SettingsUpdate(StrictModel):
+    download_dir: str | None = None
+    default_quality: Literal["high", "standard", "low"] | None = None
+    browser: Literal["auto", "chrome", "edge"] | None = None
+    source_backend: Literal["http", "pc", "chrome", "apk"] | None = None
+    apk_state_dir: str | None = None
+    apk_java_path: str | None = None
+    apk_signer_jar: str | None = None
+    apk_libcxx_path: str | None = None
+    apk_login_so_path: str | None = None
+    apk_xuid_so_path: str | None = None
+    apk_encrypt_so_path: str | None = None
+    apk_asset_dir: str | None = None
+    apk_request_timeout: float | None = Field(default=None, gt=0, le=300)
+    apk_native_timeout: float | None = Field(default=None, gt=0, le=300)
+    apk_max_consecutive_failures: int | None = Field(default=None, ge=1, le=100)
+    max_concurrency: int | None = Field(default=None, ge=1, le=16)
+    resolve_timeout: int | None = Field(default=None, ge=1, le=300)
+    http_timeout: int | None = Field(default=None, ge=1, le=1800)
+    max_attempts: int | None = Field(default=None, ge=1, le=20)
+    retry_backoff_base: float | None = Field(default=None, ge=0, le=300)
+    cooldown: float | None = Field(default=None, ge=0, le=3600)
+    global_retry_rounds: int | None = Field(default=None, ge=0, le=20)
+    chrome_path: str | None = None
+    chrome_profile_dir: str | None = None
+    cdp_port: int | None = Field(default=None, ge=1, le=65535)
+    task_db_path: str | None = None
+    risk_log_path: str | None = None
+    device_info_path: str | None = None
+    cookies_cache_path: str | None = None
+    source_impersonate: str | None = None
+    chrome_headless: bool | None = None
+    risk_fallback_headful: bool | None = None
+    reset_device_fingerprint: bool | None = None
+    experiment_rotate_device_on_risk: bool | None = None
+    experiment_browser_clear_state: bool | None = None
+    experiment_browser_fresh_profile: bool | None = None
+    experiment_rotate_headless: bool | None = None
+    experiment_persist_device_info: bool | None = None
+    experiment_strip_device_cookies: bool | None = None
+    experiment_require_identity_change: bool | None = None
+    experiment_rebirth_rounds: int | None = Field(default=None, ge=1, le=5)
+    experiment_max_device_rotations: int | None = Field(default=None, ge=0, le=100)
+    experiment_risk_cooldown_seconds: float | None = Field(
+        default=None, ge=0, le=3600,
+    )
+    risk_poll_enabled: bool | None = None
+    risk_poll_initial_wait: float | None = Field(default=None, ge=0, le=86400)
+    risk_poll_backoff_factor: float | None = Field(default=None, ge=1, le=10)
+    risk_poll_max_wait: float | None = Field(default=None, ge=0, le=86400)
+    risk_poll_max_duration: float | None = Field(default=None, ge=0, le=604800)
+
+
+def create_app(runtime: WebRuntime | None = None) -> FastAPI:
+    service = runtime or WebRuntime()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        shutdown = getattr(service, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+
+    app = FastAPI(
+        title="XDL WebUI API",
+        version="0.1.0",
+        docs_url="/api/docs",
+        openapi_url="/api/openapi.json",
+        lifespan=lifespan,
+    )
+    app.state.runtime = service
+
+    @app.exception_handler(OperationBusyError)
+    async def busy_handler(_request: Request, exc: OperationBusyError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(OperationNotCancellableError)
+    async def stop_handler(_request: Request,
+                           exc: OperationNotCancellableError):
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(XdlError)
+    async def xdl_error_handler(_request: Request, exc: XdlError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": str(exc), "category": exc.category},
+        )
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(_request: Request, exc: ValueError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.get("/api/health")
+    def health():
+        return {"ok": True}
+
+    @app.get("/api/bootstrap")
+    def bootstrap():
+        return service.bootstrap()
+
+    @app.get("/api/operation")
+    def operation(include_result: bool = False):
+        return {
+            "operation": service.operation_snapshot(
+                include_result=include_result,
+            )
+        }
+
+    @app.get("/api/tasks")
+    def tasks(state: Literal["pending", "downloading", "done", "failed"] | None = None,
+              search: str = Query(default="", max_length=200),
+              album_id: str = Query(default="", max_length=64),
+              limit: int = Query(default=100, ge=1, le=200),
+              offset: int = Query(default=0, ge=0)):
+        return service.tasks_snapshot(
+            state=state, search=search, album_id=album_id,
+            limit=limit, offset=offset,
+        )
+
+    @app.get("/api/tasks/ids")
+    def task_ids(state: Literal["pending", "downloading", "done", "failed"] | None = None,
+                 search: str = Query(default="", max_length=200),
+                 album_id: str = Query(default="", max_length=64)):
+        return service.task_ids(state=state, search=search, album_id=album_id)
+
+    @app.post("/api/tasks/preview")
+    def preview_tasks(body: TaskSelectionRequest):
+        return service.preview_tasks(body.ids)
+
+    @app.post("/api/tasks/delete")
+    def delete_tasks(body: TaskSelectionRequest):
+        return service.delete_tasks(body.ids)
+
+    @app.post("/api/tasks/requeue")
+    def requeue_tasks(body: TaskSelectionRequest):
+        return service.requeue_tasks(body.ids)
+
+    @app.get("/api/risk-report")
+    def risk_report():
+        return service.risk_report()
+
+    @app.post("/api/operations/login", status_code=202)
+    def login(body: LoginRequest | None = None):
+        return service.start_login(
+            switch_account=bool(body and body.switch_account))
+
+    @app.post("/api/auth/logout")
+    def logout():
+        """清除当前后端的登录态（APK 账号库 / 浏览器 Cookie 缓存 + Profile）。"""
+        return service.logout()
+
+    @app.get("/api/apk-auth/status")
+    def apk_auth_status():
+        return service.apk_auth_status()
+
+    @app.get("/api/apk-auth/config")
+    def apk_login_config():
+        return service.apk_login_config()
+
+    @app.post("/api/apk-auth/sms")
+    def apk_send_sms(body: ApkSmsRequest):
+        return service.apk_send_sms(body.mobile, body.fds_otp)
+
+    @app.post("/api/apk-auth/verify")
+    def apk_verify_sms(body: ApkVerifyRequest):
+        return service.apk_verify_sms(body.code)
+
+    @app.post("/api/apk-auth/password")
+    def apk_login_password(body: ApkPasswordRequest):
+        return service.apk_login_password(
+            body.account, body.password, body.mode, body.fds_otp,
+        )
+
+    @app.post("/api/apk-auth/logout")
+    def apk_logout():
+        return service.apk_logout()
+
+    @app.post("/api/apk-auth/switch")
+    def apk_switch_account(body: ApkAccountRequest):
+        return service.apk_switch_account(body.uid)
+
+    @app.post("/api/apk-auth/accounts/delete")
+    def apk_delete_account(body: ApkAccountRequest):
+        return service.apk_delete_account(body.uid)
+
+    @app.post("/api/operations/download", status_code=202)
+    def download(body: DownloadRequest):
+        return service.start_download(
+            mode=body.mode, target=body.target,
+            quality=body.quality, range_=body.range,
+        )
+
+    @app.post("/api/operations/resume", status_code=202)
+    def resume():
+        return service.start_resume()
+
+    @app.post("/api/operations/formats", status_code=202)
+    def formats(body: TargetRequest):
+        return service.start_formats(body.target)
+
+    @app.post("/api/operations/inspect-storage", status_code=202)
+    def inspect_storage():
+        return service.start_inspect_storage()
+
+    @app.post("/api/operations/gen-sign", status_code=202)
+    def gen_sign(body: GenSignRequest):
+        return service.start_gen_sign(
+            device_info_path=body.device_info_path, repeat=body.repeat,
+        )
+
+    @app.post("/api/operations/extract-device", status_code=202)
+    def extract_device(body: ExtractDeviceRequest):
+        return service.start_extract_device(
+            output=body.output, profile=body.profile,
+            headless=body.headless, refresh=body.refresh,
+            fresh_profile=body.fresh_profile,
+        )
+
+    @app.post("/api/operations/refresh-cookies", status_code=202)
+    def refresh_cookies(body: RefreshCookiesRequest):
+        return service.start_refresh_cookies(headless=body.headless)
+
+    @app.post("/api/operations/stop")
+    def stop():
+        return service.request_stop()
+
+    @app.put("/api/settings")
+    def update_settings(body: SettingsUpdate):
+        changes = body.model_dump(exclude_unset=True, exclude_none=True)
+        settings = service.update_settings(changes)
+        # 顺带回传登录态：改 source_backend 会整套换掉登录体系，前端若继续沿用
+        # 保存前的 login，头部就会一直显示上一个后端的登录信息。
+        return {"settings": settings, "login": service.login_status()}
+
+    @app.post("/api/open-downloads")
+    def open_downloads(body: OpenDownloadsRequest):
+        return service.open_downloads(body.task_id)
+
+    static_dir = Path(__file__).with_name("web_static")
+    if static_dir.is_dir():
+        app.mount("/", StaticFiles(directory=static_dir, html=True), name="webui")
+    else:
+        @app.get("/")
+        def root():
+            return {"name": "XDL WebUI", "api": "/api/docs"}
+    return app
+
+
+def serve(*, host: str = "127.0.0.1", port: int = 8787,
+          open_browser: bool = True) -> int:
+    import uvicorn
+
+    url = f"http://{host}:{port}"
+    if open_browser:
+        timer = threading.Timer(0.8, lambda: webbrowser.open(url))
+        timer.daemon = True
+        timer.start()
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print("[警告] WebUI 没有远程访问认证；请只在可信网络监听非本机地址。")
+    print(f"XDL WebUI: {url}")
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="启动 XDL 本地 WebUI")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    parser.add_argument("--port", type=int, default=8787, help="监听端口（默认 8787）")
+    parser.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error("端口必须在 1 到 65535 之间")
+    return serve(host=args.host, port=args.port, open_browser=not args.no_open)

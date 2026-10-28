@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+"""端口（抽象接口，见 docs/architecture.md「模块边界」）。
+
+用 Protocol 描述核心需要的外部能力；适配器实现它们。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
+
+from ..domain import Track, Album, DownloadTask, TaskState, Quality
+
+
+@dataclass(frozen=True)
+class TaskQueryResult:
+    """任务库分页查询结果；筛选、计数和页边界由适配器一次性保证。"""
+
+    tasks: list[DownloadTask]
+    total: int
+    counts: dict[TaskState, int]
+    offset: int
+    limit: int
+
+
+@dataclass(frozen=True)
+class TaskSelectionSummary:
+    """一批任务 id 的后果预览，供删除确认框如实列明细。
+
+    必须由存储层按真实 id 集计算：选中集可以跨页，前端手里只有当前页那 100
+    条，自己统计出来的分布会漏掉绝大部分，让确认框上的数字撒谎。
+    """
+
+    states: dict[str, int] = field(default_factory=dict)
+    running: int = 0
+    with_part: int = 0
+    part_bytes: int = 0
+    missing: int = 0
+
+
+@dataclass(frozen=True)
+class TaskDeleteResult:
+    """删除任务的结果明细，供前端如实回报而不是只说"成功"。
+
+    ``skipped_running`` 是被 ``state='downloading'`` 守卫挡下的条数：运行中的
+    任务不能删，否则下载线程会继续写一个没有记录指向的文件。
+    ``missing`` 是请求里已经不存在的 id（别处先删了），静默计数不算错误。
+    """
+
+    deleted: int = 0
+    skipped_running: int = 0
+    missing: int = 0
+    files_removed: int = 0
+    files_failed: int = 0
+
+
+@runtime_checkable
+class Decoder(Protocol):
+    """将平台返回的加密音频地址解码为可直接使用的 URL。"""
+    def decode(self, encrypted_url: str) -> str: ...
+
+
+@runtime_checkable
+class SignProvider(Protocol):
+    """生成受保护接口请求所需的 xm-sign（见 docs/architecture.md「xm-sign」）。
+
+    受保护接口（当前为 `/mobile-playpage/track/v3/baseInfo/{timestamp}`）要求请求头里带 `xm-sign`，
+    形如 ``{cadd}&&{sid}``。该端口把"如何拿到 xm-sign"这一易变点隔离起来：
+
+    - 默认实现 `PySignProvider`：纯 Python 复算 `du_web_sdk` 的签名算法
+      （device_info → zlib → AES-ECB → 上报 hdaa.shuzilm.cn → cadd&&sid），
+      不依赖浏览器、不依赖 CDP。
+    - 兜底实现可由前端按需注入（如让页面内 `du_web_sdk` 自己签、或扩展拿到）。
+    - 兼容实现 `ChromeSource` 仍可走"让页面自己签名"，但不再是默认下载路径。
+
+    实现应是**线程安全**或且**外部同步**使用（同步方法、内部自行加锁或每次返回新值）。
+    `sign()` 返回的字符串具有时效性；调用方不应自行长期缓存。
+    """
+    def open(self) -> None: ...
+    def close(self) -> None: ...
+    def sign(self) -> str: ...
+
+
+@runtime_checkable
+class Source(Protocol):
+    """音源：获取单曲与专辑（后续扩展搜索）。"""
+    async def get_track(self, track_id: str) -> Track: ...
+    async def get_album(self, album_id: str) -> Album: ...
+
+    # 批量会话：open/close 之间复用同一底层连接（如长驻浏览器），
+    # 避免逐曲重复建链。无状态实现可空实现。
+    async def open(self) -> None: ...
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
+class QualityAwareSource(Protocol):
+    """可按目标音质直接解析单曲；当前仅 APK Source 实现。"""
+    async def get_track_for_quality(self, track_id: str, quality: Quality) -> Track: ...
+
+
+@runtime_checkable
+class SynchronouslyClosableSource(Protocol):
+    """可同步释放底层长连接能力的音源（可选能力）。
+
+    Facade 的 ``close()`` 是同步的（供常驻前端重载配置/关闭进程），无法 await
+    音源的异步 ``close()``。持有长驻连接（如 APK 的 HTTP 会话）的音源实现此
+    端口，让 Facade 不必伸手进适配器内部结构（``.client.close()``）——那是
+    Message Chain，破坏了"应用层只依赖端口"的约束。
+    """
+    def close_sync(self) -> None: ...
+
+
+@runtime_checkable
+class MediaSink(Protocol):
+    """输出：把 URL 落盘（含进度回报、原子落盘）。"""
+    def write(self, url: str, target_path: str, reporter: "ProgressReporter",
+              cancel=None, progress_sink=None, expected_total: int = 0) -> None: ...
+
+
+@runtime_checkable
+class TrackResolvingMediaSink(Protocol):
+    """需要 track 上下文管理短生命周期 URL 的 sink；当前仅 APK 使用。"""
+    def write_track(self, url: str, track_id: str, quality: Quality,
+                    target_path: str, reporter: "ProgressReporter", cancel=None,
+                    progress_sink=None, expected_total: int = 0) -> None: ...
+
+
+@runtime_checkable
+class TaskStore(Protocol):
+    """任务与专辑同步状态的持久化（含断点与增量游标）。"""
+    def upsert_pending(self, tasks: list[DownloadTask]) -> list[DownloadTask]: ...
+    def mark_downloading(self, task_id: int) -> None: ...
+    def mark_done(self, task_id: int, target_path: str) -> None: ...
+    def mark_failed(self, task_id: int, category: str, msg: str,
+                    retryable: bool) -> None: ...
+    def record_progress(self, task_id: int, bytes_done: int, total: int) -> None: ...
+    def requeue_stale(self) -> int: ...
+    def requeue_retryable_failed(self) -> int: ...
+    def requeue_failed_category(self, category: str) -> int: ...
+    def pending_albums(self) -> list[tuple[str, str, int]]: ...
+    def pending_tasks(self, album_id: str) -> list[DownloadTask]: ...
+    def query_tasks(self, *, state: TaskState | None = None, search: str = "",
+                    album_id: str = "", limit: int = 100,
+                    offset: int = 0) -> TaskQueryResult: ...
+    def query_task_ids(self, *, state: TaskState | None = None,
+                       search: str = "", album_id: str = "",
+                       cap: int = 5000) -> list[int]: ...
+    def summarize_tasks(self, ids: list[int]) -> TaskSelectionSummary: ...
+    def delete_tasks(self, ids: list[int]) -> TaskDeleteResult: ...
+    def requeue_tasks(self, ids: list[int]) -> int: ...
+    def all_tasks(self) -> list[DownloadTask]: ...
+    def save_album_meta(self, album_id: str, title: str, total: int) -> None: ...
+    def save_album_cursor(self, album_id: str, cursor: str) -> None: ...
+    def album_cursor(self, album_id: str) -> str: ...
+    def album_total(self, album_id: str) -> int: ...
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class ProgressReporter(Protocol):
+    """向前端回报进度（由前端实现）。"""
+    def start(self, title: str, total: int) -> None: ...
+    def update(self, done: int, total: int) -> None: ...
+    def finish(self, path: str) -> None: ...
+    def note(self, msg: str) -> None: ...      # 批量场景的逐条说明（专辑进度/跳过/失败等）

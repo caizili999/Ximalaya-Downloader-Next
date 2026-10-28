@@ -1,0 +1,208 @@
+# 架构设计
+
+本文描述当前 checkout 已实现的结构，不把规划中的模块写成现有能力。
+
+## 1. 架构目标
+
+项目采用端口与适配器结构，外加可恢复任务引擎。核心目标是把平台易变部分——签名、Cookie、接口响应和媒体地址解码——限制在适配器层，使下载编排、任务状态和前端保持稳定。
+
+依赖方向：
+
+```text
+WebUI / CLI / Python 调用方
+          │
+          ▼
+       Facade
+          │
+          ▼
+应用用例与任务调度 ──────→ 领域模型
+          │
+          ▼
+        端口
+          ▲
+          │ 实现
+HTTP/Chrome 音源、签名、解码、文件、SQLite 适配器
+```
+
+领域层不做 I/O；应用层只依赖领域对象和端口；装配根负责选择具体适配器。
+
+## 2. 模块边界
+
+| 模块 | 职责 | 不应承担 |
+|---|---|---|
+| `domain` | 数据模型、状态、音质协商、ID/区间解析、命名 | 网络、磁盘、进程管理 |
+| `ports` | 描述应用层依赖的外部能力 | 平台响应细节 |
+| `application` | 下载、专辑、恢复、重试和停止编排 | 构造 HTTP 请求或 SQL |
+| `adapters` | 平台请求、签名、解码、下载落盘、SQLite | 用户交互流程编排 |
+| `frontends` | 参数/输入、进度和结果展示 | 复制业务规则 |
+| `composition.py` | 根据 `Settings` 组装对象图 | 下载业务逻辑 |
+| `config` | 平台常量、签名常量、用户数据路径 | 运行期任务状态 |
+
+`Facade` 是公开同步边界。它用 `asyncio.run` 驱动异步 `Source` 生命周期，使 Web 运行器、CLI 和普通脚本不需要自行管理事件循环。
+
+WebUI 在 `frontends` 内进一步分成三层：FastAPI 只负责输入校验和 HTTP 状态，`WebRuntime` 串行化长操作并桥接 `Facade`，静态 HTML/CSS/JavaScript 只消费 JSON API。下载、恢复和诊断共用同一个操作槽，避免多个浏览器/音源会话或 SQLite 写入同时发生；设置仅在空闲时允许更新，并会安全关闭旧 `Facade` 后重新装配。
+
+## 3. 下载链路与音源后端
+
+`Settings.source_backend` 选择实现 `Source` 端口的适配器，默认 `http`：
+
+| 值 | 适配器 | 身份来源 | 定位 |
+|---|---|---|---|
+| `http` | `HttpSource` | 浏览器 Profile + Cookie 缓存 + 设备信息 | 默认；本地 `xm-sign` + 网页端 `baseInfo` |
+| `pc` | `PcHttpSource` | 同上（复用 `xdl login` 的会话） | 桌面客户端接口，纯 HTTP，批量更稳 |
+| `chrome` | `ChromeSource` | 同上 | 登录实现与兼容诊断路径 |
+| `apk` | `ApkSource` | `~/.xdl/apk/` 独立身份 | Android APK 协议，与浏览器身份隔离 |
+
+前三者共享同一套浏览器身份三件套与 `xm-sign` 链路（3.1–3.2）；`apk` 完全独立。
+
+### 3.1 登录态
+
+`xdl login` 通过 `ChromeSource.interactive_login()` 打开专用浏览器（Chrome 或 Edge；同为 Chromium，CDP 行为一致，由 `Settings.browser` 决定，`auto` 时 Chrome 优先）。验证分两步：
+
+1. 在活动浏览器上下文中确认存在非空的 `*&_token` Cookie，并在关闭前捕获全部目标域 Cookie。
+2. 正常关闭浏览器后，以只读方式检查 Cookie 数据库，确认 token 已写入磁盘。
+
+`HttpSource.interactive_login()` 直接接收活动登录上下文捕获的 Cookie，并只在确认登录 token 存在时原子更新该浏览器的 Cookie 缓存（`~/.xdl/{browser}-cookies.json`）。登录后不会为了导出 Cookie 再次启动 Profile，避免会话 Cookie 跨重启丢失，也避免 Playwright 的测试凭据存储参数与系统浏览器的 Cookie 加密密钥不一致。匿名结果不会覆盖已有的有效缓存。
+
+专用 Profile 按浏览器分目录（`~/.xdl/chrome-profile` / `~/.xdl/edge-profile`）：Chromium 系 Cookie 用各浏览器自己的系统凭据存储加密（macOS Keychain / Windows DPAPI），跨浏览器打开同一 Profile 无法解密，启动时还会删除解密失败的 Cookie 行，因此两个浏览器绝不共享同一目录。Cookie 缓存与设备信息是该 Profile 的派生产物（Cookie 导出含 `_xmLog`/`wfp` 等设备指纹 Cookie，`device_info.ew1` 编码了完整 UA），同样按浏览器分文件保存，避免把一个浏览器的会话配上另一个浏览器的指纹。旧布局的 `cookies.json` / `device-info.json` 在启动时自动改名为 `chrome-*`。
+
+### 3.2 `xm-sign`
+
+`PySignProvider` 实现 `SignProvider`：
+
+```text
+device_info
+  → 紧凑 JSON
+  → URI 字节编码
+  → zlib
+  → AES-ECB + PKCS#7
+  → POST 设备上报服务
+  → Base64 解码 + AES 解密
+  → 同一次响应中的 cadd && sid
+```
+
+每次 `sign()` 进行一次设备上报，并使用该响应成对返回的 `cadd` 与 `sid`。旧的 `cadd` 缓存没有减少上报次数，还可能组合不匹配的数据，已移除内部缓存逻辑；兼容构造参数仍暂时保留。
+
+该浏览器首次登录成功后会从同一 Profile 只读采集一次设备信息（不清设备态、不用临时 Profile），使身份三件套一次齐备；采集失败只告警，不影响已完成的登录。设备信息优先读取当前浏览器的 `~/.xdl/{browser}-device-info.json`，文件不存在或不可读时使用包内 `device_info_default.json`。`Zf5` 在每次上报前更新为当前毫秒时间戳。加载设备信息时会对明显异常的 UA 字段做规范化，使上报载荷与常规浏览器形态一致；这不替代登录或内容授权。
+
+### 3.3 HTTP 音源
+
+`HttpSource.open()` 优先读取新鲜且包含登录 token 的 Cookie 缓存。只有缓存缺失、过期或匿名时才启动专用 Profile 重新导出，因此已有有效缓存时不依赖 Profile 目录仍然存在。重新导出会保留系统 Chrome 的密码存储参数，不使用 Playwright 的 mock keychain。
+
+单曲请求流程：
+
+1. 生成本次 `xm-sign`。
+2. 构造带当前毫秒时间戳的 `/mobile-playpage/track/v3/baseInfo/{ts}`。
+3. 附加 Cookie、Origin、Referer 和必要请求头。
+4. 通过 `curl-cffi` 发送；显式关闭 impersonation 时回退到 `requests`。
+5. 分类 `ret/msg`，解析播放规格并交给 `Decoder`。
+
+专辑曲目清单由 `_album_list.py` 调用公开的 `/revision/album/getTracksList`，不需要 `xm-sign`。
+
+可选实验功能：`Settings.experiment_rotate_device_on_risk`（CLI：`--experiment-rotate-device`）开启时，在识别到风控后可刷新本地设备信息并重试当前曲。默认关闭；其余参数见 `Settings`。该能力不保证恢复可用，也不构成对平台访问控制的绕过。
+
+更真实的换身默认策略（仍属实验）：
+
+1. 临时全新 Profile，只播种登录 Cookie；
+2. 有头采集，多轮清空 Cookie/storage/CacheStorage 后让 `du_web_sdk` 重生；
+3. 默认**保留**浏览器导出的设备 Cookie，与新 `device_info` 成套使用；
+4. 上报前整理 collector 快照（去掉内部 storage / 嵌套对象，消毒 Headless UA）；
+5. 若 session/hardware 身份字段（如 `GJ2`/`adi`/`acd`/`xz7`/`HW5`/`DP5`）相对换身前完全不变，则判定为假换身并中止，避免继续用旧画像连打。
+
+### 3.4 PC 桌面端音源
+
+`--source-backend pc` 选择 `PcHttpSource`，走桌面客户端使用的接口，登录态复用 `xdl login` 保存的同一份会话，全程纯 HTTP、不启动浏览器：
+
+| 用途 | 接口 |
+|---|---|
+| 专辑曲目清单 | `play/v1/show` |
+| 单集播放权限 | `play/v1/audio`（`canPlay`） |
+| 免费曲目播放地址 | `track/quality` |
+| 付费/VIP 播放地址 | `track/v3/baseInfo`（`device=win`）的加密 `playUrlList` → `WinEcbDecoder` |
+
+付费曲目的 `track/quality` 只返回试听片段，因此判权通过后改走 `baseInfo` 的加密 `playUrlList`，用 PC 端专属 AES-ECB 密钥解密（与 `config.apk.PLAY_URL_KEY` 是不同密钥，不可混用）。
+
+浏览器导出的 Cookie 缺少客户端形态的设备字段时，`baseInfo` 会因此判风控；`ensure_pc_device_cookies()` 按客户端格式补全后回写缓存。识别到风控时可复用与 HTTP 后端相同的换身链路。
+
+### 3.5 浏览器 CDP 兼容音源
+
+`--source-backend chrome` 选择 `ChromeSource`。它启动浏览器（Chrome 或 Edge，跟随 `--browser`/`Settings.browser`）后通过 CDP 连接，以只读网络响应监听取得目标 `baseInfo`；页面没有自行请求时会点击播放控件。
+
+该路径保留登录、诊断和兼容价值，但历史观测表明 CDP 环境可能被平台识别，因此不是默认下载实现。旧的设备状态重置实验默认关闭，也不在登录流程执行。
+
+### 3.6 APK 协议可选音源
+
+`--source-backend apk` 装配独立的 `ApkSource + ApkMediaSink`。它不读取浏览器 Profile、Cookie 或设备信息，运行数据位于 `~/.xdl/apk/`，与浏览器身份完全隔离；登录走 GeeTest 4 + 短信验证码，身份与登录态由 `ApkStateStore` 维护。
+
+native 算法（`create_xuid`、`ticket`/`x-tk`、登录参数 `sign`、`encryptMobile`、`decryptDownload` v0/1/2）已用纯 Python 还原在 `adapters/apk/native_py.py`，默认走这条路径（`ApkNativeBridge(prefer_python=True)`），**运行时不启动任何 Java 进程、也不需要 `.so` 资产**。常量集中在 `config/apk.py`，每组标注了来源库与反汇编地址以便审计。
+
+`prefer_python=False` 的 Java/Unidbg sidecar 路径保留下来，仅用于协议升级时与官方 `.so` 做差分比对：官方库由使用者自行从已授权安装的 APK 提取（清单与比对用 SHA-256 见 `vendor/apk_protocol/README.md`），`native_signer/` 的 Java 源码可 `mvn package` 自建。sidecar 启动前逐项校验资产清单与 SHA-256，缺清单或指纹不符即拒绝启动。
+
+下载清单只用于取得授权 trackId 和元数据；每个待下载 track 都通过 `mobile/download/v2/track/{trackId}` 单独获取本次连接，连接不写入 SQLite、也不跨集缓存。用例通过可选 `QualityAwareSource`/`TrackResolvingMediaSink` capability 分派进入 APK 路径，HTTP、PC、Chrome 三个 Source 与 `FileSink` 的调用保持不变。`ApkMediaSink` 为 CDN 添加 `requestType: download`，恢复 `.part` 前重新解析连接，连接失效时最多刷新一次。`mobile/download/*` 端点有配额：`ApkSource.resolve_track_sync` 内置串行闸，解析路径与 sink 的 URL 刷新路径共用，下载并发不会放大成对受保护接口的并发冲击。
+
+## 4. 任务与恢复
+
+`DownloadTrackUseCase`、`DownloadAlbumUseCase` 和 `ResumeUseCase` 负责：
+
+- 打开/关闭一次音源会话。
+- 将专辑曲目写入 SQLite 任务库。
+- 受保护解析与匿名 CDN 下载分两个阶段调度：解析并发由 resolve 信号量限定（`max_concurrency`；APK 因按集序计数连续失败而恒为串行），下载并发不受解析限制；窗口信号量限定「已解析未完成下载」的在途数（= 下载并发，URL 不滞留）。CLI 可通过全局参数 `--concurrency N` 覆盖。
+- 将可重试失败按类型退避，将风控错误升级为批次熔断（解析与下载两个阶段都会检查，因为 APK sink 在下载线程里刷 URL 走的也是受保护接口）；风控作为单个批次事件汇总一次，其余受影响任务保留待恢复。APK 连续失败熔断只在解析阶段计数——匿名 CDN 下载失败走逐项重试与失败收尾轮。
+- 可选的风控自动恢复（`Settings.risk_poll_enabled`，默认关闭）：熔断后进入「等待 → 单探针 → 解除后按原并发继续」循环，等待期间不发请求，每个退避周期只发一个探针（对真实待下载曲目调一次受保护接口）；探针遇 AuthError 等不可等待错误会停止，超时或被用户停止时回落为熔断语义，任务保留待人工 resume。
+- 传播用户停止信号并保留未完成任务。
+
+`SqliteTaskStore` 保存任务状态、错误、字节进度和专辑元数据。`FileSink` 使用 `.part` 文件下载；服务器支持 Range 且校验一致时续传，完成后原子替换最终文件。
+
+## 5. 错误模型
+
+所有预期业务失败继承 `XdlError`：
+
+| 类型 | 含义 | 默认策略 |
+|---|---|---|
+| `ConfigError` | 本地配置或依赖不满足 | 立即失败并给出操作提示 |
+| `AuthError` | 未登录、过期或无权访问 | 不盲目重试 |
+| `SignError` | 本地载荷或上报失败 | 受限退避重试 |
+| `NetworkError` | 超时、连接失败 | 受限退避重试 |
+| `ApiError` | 平台响应或数据形态异常 | 按 `retryable` 决定 |
+| `RiskControlError` | 已识别的频控/验证码信号 | 熔断当前批次；开启 `risk_poll` 时自动轮询等待解除后继续（默认关闭） |
+| `DecodeError` | 播放地址解码失败 | 记录失败 |
+| `StorageError` | 文件或 SQLite 失败 | 停止相关操作 |
+| `CancelledByUser` | 用户请求优雅停止 | 保存进度并返回 130 |
+
+`3005` 是复用码，只有消息语义为“系统繁忙”时才按风控处理；其他 `3005` 仍按鉴权/权限错误处理。匿名 `1001` 与已登录后的 `1001` 也分开分类。
+
+## 6. 可观测性
+
+`RiskEventRecorder` 只写最小化 JSONL：时间、trackId、耗时、分类、ret/msg、在途数、会话 ID、请求序号和认证状态。它不写 Cookie、请求头、设备信息或播放 URL。
+
+`xdl risk-report` 完全离线，支持不存在、空文件和坏行输入，并汇总会话内请求序号、延迟、间隔、并发与结果分布。
+
+## 7. 配置与本地数据
+
+`config.paths.xdl_home()` 是用户数据目录的单一来源，默认 `~/.xdl`，可由 `XDL_HOME` 覆盖。`Settings` 使用它生成 Profile、Cookie、任务库、设备信息和风控日志路径。
+
+命令行当前可覆盖下载目录、浏览器（`--browser auto|chrome|edge`，默认 auto 即 Chrome 优先、Edge 兜底）、音源后端、异步并发数，以及实验开关 `--experiment-rotate-device`。并发数必须大于 `0`；无效并发数、浏览器或后端值会快速报错，不会静默修正或退回。设备信息相关细项通过 Python `Settings` 配置。
+
+风控自动恢复默认关闭，可通过 `--risk-poll` / `--no-risk-poll` 或 WebUI 设置页「风控自动恢复」区开关；等待参数 `risk_poll_initial_wait`（首次等待，默认 30s）、`risk_poll_backoff_factor`（退避倍数，默认 2）、`risk_poll_max_wait`（单次等待上限，默认 900s）、`risk_poll_max_duration`（总等待上限，默认 3600s，0=不限）可根据本地 `xdl risk-report` 的 `recovery_seconds` 分布校准。
+
+`Settings.__post_init__` 按 `browser` 解析出实际浏览器（显式 `chrome_path` 优先，否则自动探测），并派生专用 Profile 默认目录（`{browser}-profile`）；WebUI 设置页切换浏览器时，仍为自动探测值的路径会跟随重新派生，自定义路径保持不变。
+
+## 8. 测试边界
+
+测试分为：
+
+- 领域纯函数测试。
+- 用例与任务状态测试。
+- SQLite 和文件续传测试。
+- HTTP/Chrome/签名适配器的替身契约测试。
+- CLI 行为测试。
+- WebUI 配置、运行器和 JSON API 契约测试。
+- 桌面与移动视口的真实浏览器交互检查。
+
+默认测试不访问真实平台。测试通过证明本地契约和控制流，不证明当前账号、IP、时间段下的真实服务端可用性。
+
+## 9. 已知结构债务
+
+- `Facade.from_config()` 通过函数内导入调用装配根，而装配根又需要构造 `Facade`，形成被延迟导入掩盖的静态环。消除它需要调整公开工厂入口，留待有弃用计划的版本处理。
+- Chrome 适配器仍包含已默认关闭的设备重置和高级诊断路径。它们有历史测试价值，但不属于默认 HTTP 主流程；公开入口经过弃用周期后应迁出或删除。
+- 仓库尚未配置静态类型检查、代码风格检查和覆盖率插件；当前合并门禁主要依赖 pytest、`compileall` 与差异检查。

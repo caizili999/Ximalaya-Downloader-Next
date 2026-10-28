@@ -1,0 +1,324 @@
+# -*- coding: utf-8 -*-
+"""PySignProvider 单元测试：纯算 xm-sign（不发真实网络请求）。
+
+<info>
+通过 monkeypatch 把 `requests.post` 与 `PySignProvider._fresh_sign` 中触及
+网络的环节替换为离线替身，验证：
+  1. 内置设备模板能加载、Zf5 在每次 sign 时被刷新；
+  2. report 端点被 AES-ECB 解密后的响应里取出 cadd && sid 拼成 xm-sign；
+  3. 缓存 TTL 期间复用上次结果，过期/失效后重新走签名流程。
+</info>
+"""
+import json
+import time
+
+import pytest
+
+from xdl.adapters.sign.py_sign import (PySignProvider, _aes_encrypt,
+                                         _aes_decrypt, _process_payload,
+                                         _refresh_zf5, _json_dumps_compact,
+                                         _encode_le3, _atbash,
+                                         prepare_device_info_for_report,
+                                         sanitize_device_info,
+                                         user_agent_from_device_info)
+from xdl.config import sign as sign_conf
+from xdl.errors import SignError
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+import base64
+
+
+def test_default_template_loads():
+    info = sign_conf.load_default_device_info()
+    assert isinstance(info, dict)
+    assert info["GF9"] == "2.0.0"
+    # 模板里 Zf5 留作 0，每次 sign 时由 PySignProvider 刷新
+    assert info["Zf5"] == 0
+    # 模板里已清除 HeadlessChrome 这一最明显的自动化 UA 指纹
+    assert "HeadlessChrome" not in info["ew1"]["yV2"]
+
+
+def test_atbash_le3_roundtrip_matches_sdk_encoding():
+    """Le3 = Base64(atbash(UA))，与 du_web_sdk / 线上 device_info 一致。"""
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+    le3 = _encode_le3(ua)
+    pad = "=" * ((4 - len(le3) % 4) % 4)
+    assert _atbash(base64.b64decode(le3 + pad).decode("utf-8")) == ua
+    # 字母表反转冒烟
+    assert _atbash("Mozilla") == "Nlarooz"
+    assert _atbash("HeadlessChrome") == "SvzwovhhXsilnv"
+
+
+def test_sanitize_device_info_strips_headless_chrome_ua():
+    raw = {
+        "GF9": "2.0.0",
+        "Zf5": 0,
+        "ew1": {
+            "Wg7": "Mozilla",
+            "yV2": ("5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36"),
+            "Le3": _encode_le3(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    cleaned, changed = sanitize_device_info(raw)
+    assert changed is True
+    assert "Headless" not in cleaned["ew1"]["yV2"]
+    assert "Chrome/150" in cleaned["ew1"]["yV2"]
+    ua = user_agent_from_device_info(cleaned)
+    assert ua is not None and "Headless" not in ua
+    assert cleaned["ew1"]["Le3"] == _encode_le3(ua)
+    # 原对象不被修改
+    assert "HeadlessChrome" in raw["ew1"]["yV2"]
+
+
+def test_sanitize_device_info_noop_when_already_clean():
+    info = sign_conf.load_default_device_info()
+    cleaned, changed = sanitize_device_info(info)
+    assert changed is False
+    assert cleaned["ew1"]["yV2"] == info["ew1"]["yV2"]
+
+
+def test_prepare_device_info_for_report_drops_collector_internals():
+    info = sign_conf.load_default_device_info()
+    # 模板本身带内部字段；整理后应去掉，且不改身份键
+    prepared, changed = prepare_device_info_for_report(info)
+    assert changed is True
+    for key in (
+        "_caddStorage", "_cidStorage", "_pkgStorage", "_ipfStorage",
+        "_ipflagStorage", "_checkextensions", "_checkdetects",
+        "_checkintacts", "_getmousetest", "_idstor", "infoCallback", "url_host",
+    ):
+        assert key not in prepared
+    assert prepared["HW5"] == info["HW5"]
+    assert prepared["GJ2"] == info["GJ2"]
+    assert prepared["GF9"] == info["GF9"]
+    assert "ew1" in prepared
+    # 原对象不被修改
+    assert "_cidStorage" in info
+
+
+def test_prepare_device_info_for_report_also_strips_headless():
+    raw = {
+        "HW5": "x",
+        "GJ2": "y",
+        "_cidStorage": {"_key": "cmci", "_value": "1"},
+        "ew1": {
+            "Wg7": "Mozilla",
+            "yV2": ("5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "HeadlessChrome/150.0.0.0 Safari/537.36"),
+            "Le3": "will-rewrite",
+        },
+    }
+    prepared, changed = prepare_device_info_for_report(raw)
+    assert changed is True
+    assert "_cidStorage" not in prepared
+    assert "Headless" not in prepared["ew1"]["yV2"]
+    assert "Chrome/150" in prepared["ew1"]["yV2"]
+
+
+def test_load_device_info_sanitizes_headless_file(tmp_path):
+    path = tmp_path / "device-info.json"
+    payload = {
+        "GF9": "2.0.0",
+        "Zf5": 0,
+        "HW5": "x",
+        "_cidStorage": {"_key": "cmci", "_value": "x"},
+        "ew1": {
+            "Wg7": "Mozilla",
+            "yV2": ("5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36"),
+            "Le3": "ignored-will-be-rewritten",
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    signer = PySignProvider(device_info_path=str(path))
+    signer.open()
+    info = signer.device_info()
+    assert "Headless" not in info["ew1"]["yV2"]
+    assert "Chrome/150" in user_agent_from_device_info(info)
+    assert "_cidStorage" not in info
+
+
+def test_pysign_sign_payload_excludes_internal_fields(monkeypatch):
+    captured = []
+
+    def fake_post(url, data=None, headers=None, timeout=None, verify=None):
+        import zlib
+        plain = zlib.decompress(_aes_decrypt(data, sign_conf.KEY))
+        captured.append(json.loads(plain.decode("utf-8")))
+        return _fake_report_response("c", "s")
+
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    dirty = sign_conf.load_default_device_info()
+    assert "_cidStorage" in dirty
+    signer = PySignProvider(device_info_path="/nonexistent/use-template.json")
+    signer.open()
+    # 即使 reload 塞回带内部字段的快照，sign 上报也应清掉
+    signer.reload(dirty)
+    signer.sign()
+    assert captured
+    for key in ("_cidStorage", "_checkextensions", "infoCallback", "url_host"):
+        assert key not in captured[0]
+
+
+def test_refresh_zf5_updates_timestamp_for_default_template():
+    info = sign_conf.load_default_device_info()
+    fresh = _refresh_zf5(info)
+    assert fresh["Zf5"] > 0
+    # 原字典不应被修改
+    assert info["Zf5"] == 0
+
+
+def test_aes_encrypt_decrypt_round_trip():
+    payload = b"hello-xm-sign-payload"
+    ciphertext = _aes_encrypt(payload, sign_conf.KEY)
+    plaintext = _aes_decrypt(ciphertext, sign_conf.KEY)
+    assert plaintext == payload
+
+
+def test_process_payload_shape_matches_easy_sign():
+    """`_process_payload` 输出的 bytes 与 easy-sign core.get_process_data 等价（原始 AES 密文）。"""
+    info = sign_conf.load_default_device_info()
+    info = _refresh_zf5(info)
+    payload = _process_payload(info, sign_conf.KEY)
+    # 上报 body 是原始 AES-ECB 密文 bytes（16 字节倍数 + PKCS7 padding）
+    assert isinstance(payload, bytes)
+    assert len(payload) % 16 == 0
+    # 解密后应是 zlib 流；解压得到合法 JSON 文本（device_info 序列化）
+    import zlib
+    decrypted = _aes_decrypt(payload, sign_conf.KEY)
+    text = zlib.decompress(decrypted).decode("utf-8")
+    parsed = json.loads(text)
+    assert parsed["GF9"] == "2.0.0"
+    assert parsed["Zf5"] == info["Zf5"]
+
+
+def _fake_report_response(cadd: str = "cadd_x", sid: str = "sid_y") -> object:
+    """构造一个与真实 hdaa report 接口同构的 fake response。"""
+    body_obj = {"cadd": cadd, "sid": sid}
+    cipher = AES.new(sign_conf.KEY.encode(), AES.MODE_ECB)
+    encrypted = cipher.encrypt(pad(json.dumps(body_obj).encode(), 16))
+    body_text = base64.b64encode(encrypted).decode()
+
+    class _Resp:
+        status_code = 200
+        text = body_text
+        def raise_for_status(self): pass
+    return _Resp()
+
+
+def test_pysignprovider_sign_returns_cadd_and_sid(monkeypatch):
+    captured = {}
+    def fake_post(url, data=None, headers=None, timeout=None, verify=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["verify"] = verify
+        return _fake_report_response("cadd_abc", "sid_123")
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    signer = PySignProvider(device_info_path="/nonexistent/path/use-template.json",
+                            cache_ttl=60)
+    # 文件不存在 → 应自动回退到内置模板
+    signer.open()
+    sign = signer.sign()
+    assert sign == "cadd_abc&&sid_123"
+    assert "r=" in captured["url"] and "hdaa.shuzilm.cn" in captured["url"]
+    assert captured["headers"]["Content-Type"] == "application/octet-stream"
+    assert captured["verify"] is not False
+
+
+def test_pysignprovider_uses_cadd_and_sid_from_same_report(monkeypatch):
+    """每次签名只上报一次，并使用同一次响应中成对返回的 cadd/sid。"""
+    calls = {"n": 0}
+    def fake_post(*a, **kw):
+        calls["n"] += 1
+        return _fake_report_response(f"c{calls['n']}", f"s{calls['n']}")
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    signer = PySignProvider(cache_ttl=60)
+    signer.open()
+    first = signer.sign()
+    second = signer.sign()
+
+    assert first == "c1&&s1"
+    assert second == "c2&&s2"
+    assert calls["n"] == 2
+
+
+def test_pysignprovider_invalidate_cache_remains_compatible(monkeypatch):
+    calls = {"n": 0}
+    def fake_post(*a, **kw):
+        calls["n"] += 1
+        # 模拟 hdaa 每次返回新 sid 但 cadd 不变（与服端行为一致）
+        return _fake_report_response("cadd_fixed", f"sid_{calls['n']}")
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    signer = PySignProvider(cache_ttl=60)
+    signer.open()
+    a = signer.sign()
+    signer.invalidate_cache()
+    b = signer.sign()
+    assert a == "cadd_fixed&&sid_1"
+    assert b == "cadd_fixed&&sid_2"
+    assert calls["n"] == 2
+
+
+def test_pysignprovider_raises_on_missing_cadd_sid(monkeypatch):
+    def fake_post(*a, **kw):
+        # 返回没有 cadd/sid 的内容
+        cipher = AES.new(sign_conf.KEY.encode(), AES.MODE_ECB)
+        body = json.dumps({"unrelated": True}).encode()
+        return type("R", (), {
+            "status_code": 200,
+            "text": base64.b64encode(cipher.encrypt(pad(body, 16))).decode(),
+            "raise_for_status": lambda self: None,
+        })()
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    signer = PySignProvider(cache_ttl=0)
+    signer.open()
+    with pytest.raises(SignError):
+        signer.sign()
+
+
+def test_signprovider_protocol_runtime_checkable():
+    from xdl.ports import SignProvider
+    signer = PySignProvider()
+    assert isinstance(signer, SignProvider)
+
+
+def test_pysignprovider_reload_uses_injected_device_info(monkeypatch):
+    captured = []
+
+    def fake_post(url, data=None, headers=None, timeout=None, verify=None):
+        # 解密上报 body 的 JSON，确认 reload 后的 HW5 已进入载荷
+        import zlib
+        from xdl.adapters.sign.py_sign import _aes_decrypt
+        plain = zlib.decompress(_aes_decrypt(data, sign_conf.KEY))
+        captured.append(json.loads(plain.decode("utf-8")))
+        return _fake_report_response("c", "s")
+
+    import xdl.adapters.sign.py_sign as mod
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    signer = PySignProvider(device_info_path="/nonexistent/use-template.json")
+    signer.open()
+    original = signer.device_info()
+    injected = dict(original)
+    injected["HW5"] = "hw-injected-for-reload"
+    signer.reload(injected)
+    signer.sign()
+
+    assert captured and captured[0]["HW5"] == "hw-injected-for-reload"
+    assert captured[0]["HW5"] != original["HW5"]

@@ -1,0 +1,297 @@
+# -*- coding: utf-8 -*-
+"""从 Chrome 用户目录提取登录 Cookie（供 HttpSource 纯 HTTP 路径使用）。
+
+XDL 的 `xdl login` 已用专用 Chrome Profile 持久化了登录态。HttpSource 不走 CDP
+接管、也不发受保护请求——它只需要把那批登录 Cookie 读出来塞进自己的 `requests`
+请求头里。这里用 Playwright 的 `launch_persistent_context` 短暂启动用户已有的
+Profile（不复用 `xdl login` 启动的进程），默认直接读取 `cookies()`，不导航到站点。
+只有显式指定 `visit_home=True` 时才访问首页；导出后立即关闭上下文。
+
+也提供 JSON 缓存（`~/.xdl/cookies.json`）——一次提取后 HttpSource 可直接读 JSON，
+不必每次启动都开一遍浏览器。
+"""
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import time
+import uuid
+from typing import Iterable
+
+from ...config import platform
+
+_LOGIN_COOKIE_SUFFIX = "&_token"
+
+# PC 桌面端接口（play/v1/*、baseInfo）要求请求里带客户端设备身份 Cookie；
+# 缺任意一项时，付费曲目在 baseInfo 会被风控（ret=1001 系统繁忙）。Web 端
+# `xdl login` 不会种这三项，这里按官方 PC 客户端 4.0.14 抓包格式自动补全。
+_PC_DEVICE_COOKIES = (
+    # install_id / channel：埋点接口种在 .pc.ximalaya.com
+    ("install_id", "{uuid}", ".pc.ximalaya.com",
+     "/pc-application-server/burying/pcClient"),
+    ("channel", "99&100001", ".pc.ximalaya.com",
+     "/pc-application-server/burying/pcClient"),
+    # 1&_device：win32&<设备UUID>&4.0.14，与 install_id 同设备 ID
+    ("1&_device", "win32&{uuid}&4.0.14", ".ximalaya.com", "/"),
+)
+
+# 设备/反垃圾/埋点类 Cookie。剥离它们可在 HTTP 路径上让身份主要跟
+# xm-sign 的 device_info 走，避免 Cookie 碎片把“新身”粘回旧惩罚态。
+# 前缀匹配：历史设备 ID、百度统计、SDK 混淆键（assva*/cmci*/vmce*/pmck*）。
+_DEVICE_COOKIE_PREFIXES = (
+    "_xmLog", "wfp", "Hm_lvt_", "Hm_lpvt_",
+    "assva", "cmci", "vmce", "pmck",
+)
+# 精确名：localStorage 镜像到 Cookie 的设备指纹、统计账户镜像等。
+_DEVICE_COOKIE_EXACT = frozenset({
+    "crystal",
+    "HMACCOUNT",
+    "cid",
+    "_antispam_",
+})
+
+
+def is_device_fingerprint_cookie(name) -> bool:
+    """判断 Cookie 名是否为设备/统计类指纹载体（不读 value）。"""
+    text = str(name or "")
+    if not text:
+        return False
+    if text in _DEVICE_COOKIE_EXACT:
+        return True
+    return text.startswith(_DEVICE_COOKIE_PREFIXES)
+
+
+def strip_device_cookies(cookies: Iterable[dict]) -> list[dict]:
+    """保留登录等业务 Cookie，去掉设备指纹类 Cookie。"""
+    return [c for c in cookies if not is_device_fingerprint_cookie(c.get("name"))]
+
+
+def device_cookie_delete_targets(cookies: Iterable[dict]) -> list[dict[str, str]]:
+    """生成 CDP ``Network.deleteCookie`` 所需的定向删除参数。"""
+    targets = []
+    for cookie in cookies:
+        if not is_device_fingerprint_cookie(cookie.get("name")):
+            continue
+        targets.append({
+            "name": str(cookie.get("name") or ""),
+            "domain": str(cookie.get("domain") or ""),
+            "path": str(cookie.get("path") or "/"),
+        })
+    return targets
+
+
+def is_login_cookie(cookies: Iterable[dict]) -> bool:
+    """只判断登录 token 是否存在；不读 value。"""
+    return any(
+        str(c.get("name") or "").endswith(_LOGIN_COOKIE_SUFFIX) and bool(c.get("value"))
+        for c in cookies
+    )
+
+
+def ensure_pc_device_cookies(cookies: list[dict]) -> list[dict]:
+    """补全 PC 桌面端接口所需的设备身份 Cookie；已有同名值则原样保留。
+
+    返回追加了缺失项的新列表（不改动传入列表）。值按官方客户端 4.0.14
+    抓包格式生成：``install_id`` 为 36 位 UUID，``1&_device`` 为
+    ``win32&<同一UUID>&4.0.14``，``channel`` 为 ``99&100001``。
+    """
+    existing = {c.get("name") for c in cookies}
+    if all(name in existing for name, _fmt, _dom, _path in _PC_DEVICE_COOKIES):
+        return list(cookies)
+    dev_uuid = str(uuid.uuid4())
+    extended = list(cookies)
+    for name, fmt, domain, path in _PC_DEVICE_COOKIES:
+        if name in existing:
+            continue
+        extended.append({
+            "name": name,
+            "value": fmt.format(uuid=dev_uuid),
+            "domain": domain,
+            "path": path,
+        })
+    return extended
+
+
+def is_login_related_cookie(name) -> bool:
+    """是否为应跨设备保留的登录相关 Cookie（不含设备指纹）。"""
+    text = str(name or "")
+    if not text:
+        return False
+    if text.endswith(_LOGIN_COOKIE_SUFFIX):
+        return True
+    if text.endswith("&remember_me"):
+        return True
+    return text in {"web_login"}
+
+
+def login_cookies_only(cookies: Iterable[dict]) -> list[dict]:
+    """只保留登录相关 Cookie，供全新 Profile 播种登录态。"""
+    return [
+        dict(c) for c in cookies
+        if is_login_related_cookie(c.get("name")) and c.get("value") is not None
+    ]
+
+
+def extract_cookies_from_profile(
+    profile_dir: str,
+    chrome_path: str = "",
+    headless: bool = True,
+    cookie_domain: str = platform.BASE,
+    timeout_ms: int = 30000,
+    wait_ms: int = 1500,
+    visit_home: bool = False,
+    browser: str = "chrome",
+) -> list[dict]:
+    """短暂启动浏览器（共用专用 Profile，如 `~/.xdl/chrome-profile`），读出 ximalaya.com 域 Cookie。
+
+    返回的 Cookie 形如：
+        [{"name": "1&_token", "value": "...", "domain": ".ximalaya.com",
+          "path": "/", "httpOnly": True, "secure": True, ...}, ...]
+
+    与 `requests` 兼容（用 `name/value` 拼 Cookie 头即可，安全标志由 HTTPS 保障）。
+    `browser` 决定无显式路径时 Playwright 的 channel（chrome / msedge）。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError(
+            "提取登录 Cookie 需要安装 Playwright：pip install playwright") from exc
+
+    if not os.path.isdir(profile_dir):
+        raise FileNotFoundError(
+            f"浏览器 Profile 目录不存在: {profile_dir}。请先运行 `xdl login` 创建。")
+
+    launch_kwargs = dict(
+        headless=headless,
+        viewport={"width": 1440, "height": 900},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
+        # 登录 Profile 由系统浏览器直接启动并使用系统凭据存储加密 Cookie。
+        # Playwright 默认追加的这两个参数会改用测试用密码存储；在 macOS 上尤其会让
+        # 浏览器无法解密刚写入的 Keychain Cookie，并在启动时删除对应数据库行。
+        ignore_default_args=["--password-store=basic", "--use-mock-keychain"],
+        args=[
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--mute-audio",
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-blink-features=AutomationControlled",
+        ],
+        user_data_dir=profile_dir,
+    )
+    if chrome_path:
+        launch_kwargs["executable_path"] = chrome_path
+    else:
+        launch_kwargs["channel"] = "msedge" if browser == "edge" else "chrome"
+
+    cookies: list[dict] = []
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(**launch_kwargs)
+        try:
+            if visit_home:
+                page = ctx.new_page()
+                try:
+                    page.goto(platform.HOME_URL, wait_until="domcontentloaded",
+                              timeout=timeout_ms)
+                    page.wait_for_timeout(wait_ms)
+                except Exception:
+                    # 显式导航失败时仍尝试读已落盘 Cookie。
+                    pass
+            # 读全部域的 Cookie，再按目标 host 过滤；避免错过跨子域的登录 Cookie
+            all_cookies = ctx.cookies()
+            cookies = filter_cookies_for_domain(all_cookies, cookie_domain)
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+    return cookies
+
+
+def _cookie_matches(cookie: dict, domain: str) -> bool:
+    """简单判断 cookie 是否属于 ximalaya.com（含子域）。"""
+    cookie_host = str(cookie.get("domain") or "").lstrip(".").lower()
+    host = domain.replace("https://", "").replace("http://", "")
+    # 去掉 host 里的端口和路径
+    host = host.split("/", 1)[0].split(":", 1)[0].lower()
+    # 平台入口是 www.ximalaya.com，但导出需要覆盖 mobile.ximalaya.com 等兄弟
+    # 子域；把常见 www 入口归一到站点根域后再做点边界匹配。
+    site_host = host[4:] if host.startswith("www.") else host
+    return cookie_host == site_host or cookie_host.endswith("." + site_host)
+
+
+def filter_cookies_for_domain(
+    cookies: Iterable[dict], domain: str = platform.BASE,
+) -> list[dict]:
+    """筛出目标站点及其子域 Cookie，同时保留浏览器返回的完整字段。"""
+    return [c for c in cookies if _cookie_matches(c, domain)]
+
+
+def build_cookie_header(cookies: Iterable[dict]) -> str:
+    """把 cookie 列表组装成 `Cookie:` 请求头的值。"""
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies
+                     if c.get("name") and c.get("value") is not None)
+
+
+def save_cookies(cookies: list[dict], path: str) -> None:
+    """原子地缓存 Cookie 到 JSON（value 含登录态，按文件权限保护）。"""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    slim = [
+        {
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "domain": c.get("domain"),
+            "path": c.get("path", "/"),
+        }
+        for c in cookies
+        if c.get("name") and c.get("value")
+    ]
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".cookies-", suffix=".tmp", dir=directory or ".",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(slim, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def clear_cookie_cache(path: str) -> bool:
+    """删除 Cookie 缓存文件；本来就不存在时返回 False 而不是报错。"""
+    if not path:
+        return False
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return False
+    except IsADirectoryError as exc:
+        raise ValueError(f"cookies_cache_path 指向目录，拒绝删除: {path}") from exc
+    return True
+
+
+def load_cached_cookies(path: str, max_age_seconds: int = 1800) -> list[dict] | None:
+    """若缓存文件存在且足够新鲜则返回内容，否则返回 None。"""
+    if not os.path.exists(path):
+        return None
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+    if age > max_age_seconds:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
